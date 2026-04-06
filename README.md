@@ -147,4 +147,3 @@ Only the SNN is updated. OLMoE stays **completely frozen**:
 ## License
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
-# spikenaut-hybrid

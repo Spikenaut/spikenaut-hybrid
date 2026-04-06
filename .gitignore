@@ -1,0 +1,27 @@
+# Rust
+/target
+Cargo.lock
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment and Logs
+.env
+*.log
+
+# Models (prevent accidental GGUF/safetensors check-in)
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# Temporary / Scratch
+/tmp/
