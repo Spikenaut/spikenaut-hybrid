@@ -16,12 +16,23 @@
 //! OLMOE_PATH=/models/OLMoE-1B-7B-Q5_K_M.gguf cargo run --example hybrid_telemetry --features gguf
 //! ```
 
-use spikenaut_hybrid::{HybridConfig, HybridModel, ProjectionMode, EMBEDDING_DIM};
+use spikenaut_hybrid::{
+    EMBEDDING_DIM, HybridConfig, HybridModel, OlmoeExecutionMode, ProjectionMode,
+};
 use spikenaut_telemetry::TelemetrySnapshot;
 
 fn main() -> spikenaut_hybrid::Result<()> {
     // ── 1. Configuration ─────────────────────────────────────────────────────
     let model_path = std::env::var("OLMOE_PATH").unwrap_or_default();
+    let olmoe_execution_mode = match std::env::var("OLMOE_MODE")
+        .unwrap_or_else(|_| "stub".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "dense" => OlmoeExecutionMode::DenseSim,
+        "spiking" => OlmoeExecutionMode::SpikingSim,
+        _ => OlmoeExecutionMode::StubUniform,
+    };
     if model_path.is_empty() {
         println!("ℹ  OLMOE_PATH not set — running in stub mode (no LLM checkpoint needed).");
         println!("   Set OLMOE_PATH=/path/to/OLMoE-1B-7B-Q5_K_M.gguf for real inference.\n");
@@ -35,6 +46,7 @@ fn main() -> spikenaut_hybrid::Result<()> {
         context_length: 512,
         num_experts: 8,
         top_k_experts: 1,
+        olmoe_execution_mode,
         initial_dopamine: 0.6,
         projection_mode: ProjectionMode::RateSum,
         ..Default::default()
@@ -43,6 +55,7 @@ fn main() -> spikenaut_hybrid::Result<()> {
     println!("⚙  Config:");
     println!("   SNN steps / forward: {}", cfg.snn_steps);
     println!("   Projection mode    : {:?}", cfg.projection_mode);
+    println!("   OLMoE mode         : {:?}", cfg.olmoe_execution_mode);
     println!("   OLMoE experts       : {} (top-{})", cfg.num_experts, cfg.top_k_experts);
     println!();
 
@@ -75,12 +88,13 @@ fn main() -> spikenaut_hybrid::Result<()> {
             timestamp_ms: (t as u64) * 1000,
             gpu_temp_c: gpu_temp,
             gpu_power_w: gpu_power,
+            gpu_clock_mhz: 1800.0 + phase * 600.0,
+            mem_util_pct: (55.0 + phase * 35.0).clamp(0.0, 100.0),
             cpu_tctl_c: 55.0 + (phase * std::f32::consts::PI).sin() * 15.0,
             cpu_package_power_w: 80.0 + phase * 40.0,
-            dynex_hashrate_mh: dynex_hash,
-            qubic_tick_trace: (phase * 3.0).sin().abs(),
-            qubic_epoch_progress: phase,
-            ocean_intel: 0.5 + 0.3 * (phase * std::f32::consts::TAU).cos(),
+            workload_throughput: dynex_hash,
+            workload_efficiency: (0.5 + 0.3 * (phase * std::f32::consts::TAU).cos()) as f64,
+            auxiliary_signal: (phase * 3.0).sin().abs() as f64,
             ..Default::default()
         };
 

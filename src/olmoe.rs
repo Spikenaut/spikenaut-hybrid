@@ -37,7 +37,7 @@
 //! | *(none)* | Stub mode only |
 
 use crate::error::{HybridError, Result};
-use crate::types::EMBEDDING_DIM;
+use crate::types::{EMBEDDING_DIM, OlmoeExecutionMode};
 
 // ── Internal model constants ───────────────────────────────────────────────────
 
@@ -87,6 +87,12 @@ pub struct OLMoE {
 
     /// Cached model metadata (populated on load).
     metadata: OlmoeMetadata,
+
+    execution_mode: OlmoeExecutionMode,
+    expert_membranes: Vec<f32>,
+    hidden_membranes: Vec<f32>,
+    threshold: f32,
+    decay: f32,
 }
 
 /// Metadata extracted from the model checkpoint.
@@ -123,6 +129,15 @@ impl OLMoE {
     ///   64 internal experts; pass 8 unless you need per-layer granularity).
     /// * `top_k` — experts activated per token (default 1 in the plan).
     pub fn load(model_path: &str, num_experts: usize, top_k: usize) -> Result<Self> {
+        Self::load_with_mode(model_path, num_experts, top_k, OlmoeExecutionMode::StubUniform)
+    }
+
+    pub fn load_with_mode(
+        model_path: &str,
+        num_experts: usize,
+        top_k: usize,
+        execution_mode: OlmoeExecutionMode,
+    ) -> Result<Self> {
         let top_k = top_k.max(1).min(num_experts);
 
         if model_path.is_empty() {
@@ -138,6 +153,11 @@ impl OLMoE {
                     num_experts: OLMOE_NUM_EXPERTS,
                     quantization: "stub".into(),
                 },
+                execution_mode,
+                expert_membranes: vec![0.0; num_experts],
+                hidden_membranes: vec![0.0; EMBEDDING_DIM],
+                threshold: 0.75,
+                decay: 0.91,
             });
         }
 
@@ -149,6 +169,11 @@ impl OLMoE {
             top_k,
             loaded: true,
             metadata: loaded,
+            execution_mode,
+            expert_membranes: vec![0.0; num_experts],
+            hidden_membranes: vec![0.0; EMBEDDING_DIM],
+            threshold: 0.75,
+            decay: 0.91,
         })
     }
 
@@ -171,7 +196,7 @@ impl OLMoE {
     /// # Errors
     /// * [`HybridError::InputLengthMismatch`] if `embedding.len() != EMBEDDING_DIM`.
     /// * [`HybridError::OlmoeForward`] if the frozen forward pass fails.
-    pub fn forward(&self, embedding: &[f32]) -> Result<OlmoeOutput> {
+    pub fn forward(&mut self, embedding: &[f32]) -> Result<OlmoeOutput> {
         if embedding.len() != EMBEDDING_DIM {
             return Err(HybridError::InputLengthMismatch {
                 expected: EMBEDDING_DIM,
@@ -179,17 +204,11 @@ impl OLMoE {
             });
         }
 
-        if !self.loaded {
-            return Ok(self.stub_output());
+        match self.execution_mode {
+            OlmoeExecutionMode::StubUniform => Ok(self.stub_output()),
+            OlmoeExecutionMode::DenseSim => self.simulate_moe_routing(embedding),
+            OlmoeExecutionMode::SpikingSim => self.spiking_moe_routing(embedding),
         }
-
-        // ── Real forward pass ─────────────────────────────────────────────────
-        // With the `gguf` or `safetensors` feature enabled the weights would be
-        // memory-mapped here and used for a quantised matmul.  For now the
-        // routing simulation below correctly models the MoE gating behaviour
-        // using the embedding as input — ideal for integration testing before
-        // the full checkpoint is downloaded.
-        self.simulate_moe_routing(embedding)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -302,6 +321,91 @@ impl OLMoE {
         })
     }
 
+    fn spiking_moe_routing(&mut self, embedding: &[f32]) -> Result<OlmoeOutput> {
+        let n = self.num_experts;
+
+        let mut gate_scores = Vec::with_capacity(n);
+        let mut expert_spikes = vec![0.0_f32; n];
+        for expert_id in 0..n {
+            let mut acc = 0.0_f32;
+            for (j, &e) in embedding.iter().enumerate() {
+                let w = Self::pseudo_weight(expert_id, j, EMBEDDING_DIM);
+                acc += w * e;
+            }
+
+            self.expert_membranes[expert_id] =
+                self.expert_membranes[expert_id] * self.decay + acc * 0.18;
+
+            let spike = if self.expert_membranes[expert_id] > self.threshold {
+                self.expert_membranes[expert_id] -= self.threshold;
+                1.0
+            } else if self.expert_membranes[expert_id] < -self.threshold {
+                self.expert_membranes[expert_id] += self.threshold;
+                -1.0
+            } else {
+                0.0
+            };
+
+            expert_spikes[expert_id] = spike;
+            gate_scores.push(self.expert_membranes[expert_id] + spike * self.threshold);
+        }
+
+        let max_score = gate_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_scores: Vec<f32> = gate_scores.iter().map(|s| (s - max_score).exp()).collect();
+        let sum_exp: f32 = exp_scores.iter().sum();
+        let expert_weights: Vec<f32> = if sum_exp > 0.0 && sum_exp.is_finite() {
+            exp_scores.iter().map(|e| e / sum_exp).collect()
+        } else {
+            vec![1.0 / n as f32; n]
+        };
+
+        let mut indexed: Vec<(usize, f32)> = expert_weights
+            .iter()
+            .copied()
+            .enumerate()
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let selected_experts: Vec<usize> = indexed[..self.top_k].iter().map(|&(i, _)| i).collect();
+
+        let mut hidden = vec![0.0_f32; EMBEDDING_DIM];
+        for &expert_id in &selected_experts {
+            let active_signal = if expert_spikes[expert_id].abs() > 0.5 {
+                expert_spikes[expert_id]
+            } else {
+                0.0
+            };
+
+            if active_signal == 0.0 {
+                continue;
+            }
+
+            for (j, h) in hidden.iter_mut().enumerate() {
+                let gain = Self::pseudo_weight(expert_id, j + expert_id * 1000, EMBEDDING_DIM);
+                let input = active_signal * gain * embedding[j % embedding.len()];
+
+                self.hidden_membranes[j] = self.hidden_membranes[j] * self.decay + input * 1.5;
+
+                let spike = if self.hidden_membranes[j] > self.threshold {
+                    self.hidden_membranes[j] -= self.threshold;
+                    1.0
+                } else if self.hidden_membranes[j] < -self.threshold {
+                    self.hidden_membranes[j] += self.threshold;
+                    -1.0
+                } else {
+                    0.0
+                };
+
+                *h += spike * 0.3;
+            }
+        }
+
+        Ok(OlmoeOutput {
+            expert_weights,
+            selected_experts,
+            hidden,
+        })
+    }
+
     /// Uniform stub output — used in stub mode (no model loaded).
     fn stub_output(&self) -> OlmoeOutput {
         let n = self.num_experts;
@@ -336,6 +440,11 @@ impl OLMoE {
         self.loaded
     }
 
+    pub fn reset_state(&mut self) {
+        self.expert_membranes.fill(0.0);
+        self.hidden_membranes.fill(0.0);
+    }
+
     /// Model checkpoint path (empty string in stub mode).
     pub fn model_path(&self) -> &str {
         &self.model_path
@@ -346,9 +455,31 @@ impl OLMoE {
         &self.metadata.quantization
     }
 
+    pub fn hidden_size(&self) -> usize {
+        self.metadata.hidden_size
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.metadata.num_layers
+    }
+
+    pub fn checkpoint_num_experts(&self) -> usize {
+        self.metadata.num_experts
+    }
+
     /// Number of available experts as configured.
     pub fn num_experts(&self) -> usize {
         self.num_experts
+    }
+
+    pub fn execution_mode(&self) -> OlmoeExecutionMode {
+        self.execution_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_state_activity(&self) -> bool {
+        self.expert_membranes.iter().any(|&v| v != 0.0)
+            || self.hidden_membranes.iter().any(|&v| v != 0.0)
     }
 }
 
@@ -359,7 +490,18 @@ mod tests {
     use super::*;
 
     fn stub() -> OLMoE {
-        OLMoE::load("", 8, 1).expect("stub load should succeed")
+        OLMoE::load_with_mode("", 8, 1, OlmoeExecutionMode::StubUniform)
+            .expect("stub load should succeed")
+    }
+
+    fn dense_sim_stub() -> OLMoE {
+        OLMoE::load_with_mode("", 8, 2, OlmoeExecutionMode::DenseSim)
+            .expect("dense sim stub load should succeed")
+    }
+
+    fn spiking_sim_stub() -> OLMoE {
+        OLMoE::load_with_mode("", 8, 2, OlmoeExecutionMode::SpikingSim)
+            .expect("spiking sim stub load should succeed")
     }
 
     #[test]
@@ -371,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_stub_forward_shape() {
-        let model = stub();
+        let mut model = stub();
         let embedding = vec![0.0_f32; EMBEDDING_DIM];
         let out = model.forward(&embedding).unwrap();
         assert_eq!(out.expert_weights.len(), 8);
@@ -381,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_stub_forward_uniform_weights() {
-        let model = stub();
+        let mut model = stub();
         let embedding = vec![0.1_f32; EMBEDDING_DIM];
         let out = model.forward(&embedding).unwrap();
         for w in &out.expert_weights {
@@ -391,31 +533,53 @@ mod tests {
 
     #[test]
     fn test_input_length_mismatch() {
-        let model = stub();
+        let mut model = stub();
         let bad_embedding = vec![0.0_f32; 64];
         assert!(model.forward(&bad_embedding).is_err());
     }
 
     #[test]
-    fn test_routing_with_loaded_model_simulation() {
-        // Simulate a "loaded" model by building one with an in-memory path
-        // (probe_and_load will fail but we test simulate_moe_routing directly).
-        let model = OLMoE {
-            model_path: "/fake/path".into(),
-            num_experts: 8,
-            top_k: 2,
-            loaded: true, // pretend it's loaded
-            metadata: OlmoeMetadata {
-                hidden_size: OLMOE_HIDDEN,
-                num_layers: 16,
-                num_experts: 64,
-                quantization: "Q5_K_M".into(),
-            },
-        };
+    fn test_dense_sim_in_stub_mode_has_valid_routing() {
+        let mut model = dense_sim_stub();
         let embedding: Vec<f32> = (0..EMBEDDING_DIM).map(|i| (i as f32 / EMBEDDING_DIM as f32) * 0.1).collect();
-        let out = model.simulate_moe_routing(&embedding).unwrap();
+        let out = model.forward(&embedding).unwrap();
         assert_eq!(out.selected_experts.len(), 2);
         let weight_sum: f32 = out.expert_weights.iter().sum();
         assert!((weight_sum - 1.0).abs() < 1e-5, "expert weights must sum to 1, got {weight_sum}");
+        assert_eq!(out.hidden.len(), EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn test_spiking_sim_persists_state_and_can_fire() {
+        let mut model = spiking_sim_stub();
+        let embedding = vec![1.0_f32; EMBEDDING_DIM];
+
+        let first = model.forward(&embedding).unwrap();
+        assert!(model.expert_membranes.iter().any(|&v| v != 0.0));
+
+        let mut fired = first.hidden.iter().any(|&v| v != 0.0);
+        for _ in 0..32 {
+            let out = model.forward(&embedding).unwrap();
+            if out.hidden.iter().any(|&v| v != 0.0) {
+                fired = true;
+                break;
+            }
+        }
+
+        assert!(fired, "spiking sim should eventually emit ternary hidden events");
+    }
+
+    #[test]
+    fn test_spiking_sim_reset_clears_state() {
+        let mut model = spiking_sim_stub();
+        let embedding = vec![1.0_f32; EMBEDDING_DIM];
+
+        let _ = model.forward(&embedding).unwrap();
+        assert!(model.expert_membranes.iter().any(|&v| v != 0.0));
+
+        model.reset_state();
+
+        assert!(model.expert_membranes.iter().all(|&v| v == 0.0));
+        assert!(model.hidden_membranes.iter().all(|&v| v == 0.0));
     }
 }

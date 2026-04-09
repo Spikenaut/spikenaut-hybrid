@@ -121,9 +121,9 @@ HybridModel::train_step(&snap, &target)
 | Crate | Role |
 |-------|------|
 | [`neuromod`](https://crates.io/crates/neuromod) | LIF + Izhikevich SNN with R-STDP |
-| [`spikenaut-encoder`](https://github.com/rmems/spikenaut-encoder) | Neuromodulator-driven Poisson encoding |
-| [`spikenaut-telemetry`](https://github.com/rmems/spikenaut-telemetry) | GPU/CPU/mining hardware telemetry |
-| [`spikenaut-spine`](https://github.com/rmems/spikenaut-spine) | ZMQ IPC Rust ↔ Julia bridge |
+| [`spikenaut-encoder`](https://github.com/Spikenaut/spikenaut-encoder) | Neuromodulator-driven Poisson encoding |
+| [`spikenaut-telemetry`](https://github.com/Spikenaut/spikenaut-telemetry) | GPU/CPU/mining hardware telemetry |
+| [`spikenaut-spine`](https://github.com/Spikenaut/spikenaut-spine) | ZMQ IPC Rust ↔ Julia bridge |
 | `SpikenautDistill.jl` | Julia E-prop / OTTT SNN trainer (private) |
 
 ## Training loop

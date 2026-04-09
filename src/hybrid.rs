@@ -25,10 +25,14 @@
 use crate::error::{HybridError, Result};
 use crate::olmoe::OLMoE;
 use crate::projector::Projector;
-use crate::types::{HybridConfig, HybridOutput, ProjectionMode, TrainSignal, EMBEDDING_DIM};
+use crate::types::{
+    EMBEDDING_DIM, HybridConfig, HybridOutput, SNN_INPUT_CHANNELS, TrainSignal,
+};
 
 use neuromod::SpikingNetwork;
-use spikenaut_encoder::NeuromodSensoryEncoder;
+use spikenaut_encoder::encoders::neuromod::NeuromodSensoryEncoder;
+use spikenaut_encoder::modulators::NeuroModulators as EncoderNeuroModulators;
+use spikenaut_encoder::Encoder;
 use spikenaut_telemetry::TelemetrySnapshot;
 
 // ── HybridModel ───────────────────────────────────────────────────────────────
@@ -87,15 +91,19 @@ impl HybridModel {
             )));
         }
 
-        let mut encoder = NeuromodSensoryEncoder::new();
-        encoder.set_mining_dopamine(config.initial_dopamine - 0.5);
+        let mut encoder = NeuromodSensoryEncoder::new(8, SNN_INPUT_CHANNELS);
+        encoder.update_neuromodulators(EncoderNeuroModulators {
+            mining_dopamine: config.initial_dopamine - 0.5,
+            ..Default::default()
+        });
 
         let snn = SpikingNetwork::new();
         let projector = Projector::new(config.projection_mode);
-        let olmoe = OLMoE::load(
+        let olmoe = OLMoE::load_with_mode(
             &config.olmoe_model_path,
             config.num_experts,
             config.top_k_experts,
+            config.olmoe_execution_mode,
         )?;
 
         Ok(Self { config, encoder, snn, projector, olmoe, global_step: 0 })
@@ -120,8 +128,10 @@ impl HybridModel {
         self.update_neuromodulators_from_snapshot(snap);
 
         // Stage 3: encode + SNN
-        let stimuli_16 = self.encoder.encode_poisson_stimuli(&market_inputs);
-        let enc_mods = *self.encoder.get_neuromodulators();
+        let enc_mods = self.encoder_modulators_from_snapshot(snap);
+        self.encoder.update_neuromodulators(enc_mods);
+        let encoded = self.encoder.encode(&market_inputs);
+        let stimuli_16 = Self::encoded_output_to_stimuli(&encoded);
         let neuromod = bridge_modulators(&enc_mods);
 
         let mut spike_train: Vec<Vec<usize>> = Vec::with_capacity(self.config.snn_steps);
@@ -205,9 +215,13 @@ impl HybridModel {
     // ── Reset ─────────────────────────────────────────────────────────────────
 
     /// Reset SNN state to initial conditions (membrane potentials, spike times,
-    /// STDP eligibility traces).  Projector weights and OLMoE are unaffected.
+    /// STDP eligibility traces).  Projector weights are unaffected.
+    /// Also resets the projector and OLMoE GIF membrane state so no stale
+    /// spiking history bleeds across episodes.
     pub fn reset(&mut self) {
         self.snn.reset();
+        self.projector.reset_membrane();
+        self.olmoe.reset_state();
         self.global_step = 0;
     }
 
@@ -251,17 +265,41 @@ impl HybridModel {
             (snap.gpu_power_w / 450.0).clamp(0.0, 1.0),
             ((snap.cpu_tctl_c - 40.0) / 50.0).clamp(0.0, 1.0),
             (snap.cpu_package_power_w / 150.0).clamp(0.0, 1.0),
-            snap.mining_efficiency(),
-            (snap.dynex_hashrate_mh / 0.015).clamp(0.0, 1.0) as f32,
-            snap.qubic_tick_trace,
-            snap.ocean_intel.clamp(0.0, 1.0),
+            snap.workload_efficiency as f32,
+            (snap.workload_throughput as f32 / 1000.0).clamp(0.0, 1.0),
+            (snap.mem_util_pct / 100.0).clamp(0.0, 1.0),
+            ((snap.auxiliary_signal as f32).abs()).clamp(0.0, 1.0),
         ]
     }
 
     /// Push live telemetry signals into the encoder's neuromodulator state.
     fn update_neuromodulators_from_snapshot(&mut self, snap: &TelemetrySnapshot) {
-        self.encoder.set_market_volatility(snap.thermal_stress());
-        self.encoder.set_mining_dopamine((snap.mining_efficiency() - 0.5) * 1.6);
+        let modulators = self.encoder_modulators_from_snapshot(snap);
+        self.encoder.update_neuromodulators(modulators);
+    }
+
+    fn encoder_modulators_from_snapshot(&self, snap: &TelemetrySnapshot) -> EncoderNeuroModulators {
+        EncoderNeuroModulators {
+            dopamine: (snap.workload_efficiency as f32).clamp(0.0, 1.0),
+            cortisol: snap.thermal_stress().clamp(0.0, 1.0),
+            acetylcholine: (snap.mem_util_pct / 100.0).clamp(0.0, 1.0),
+            tempo: (0.5 + (snap.gpu_clock_mhz / 3000.0)).clamp(0.5, 2.0),
+            fpga_stress: 0.0,
+            market_volatility: ((snap.auxiliary_signal as f32).abs()).clamp(0.0, 1.0),
+            mining_dopamine: ((snap.workload_efficiency as f32) - 0.5) * 1.6,
+        }
+    }
+
+    fn encoded_output_to_stimuli(encoded: &spikenaut_encoder::types::EncodedOutput) -> [f32; SNN_INPUT_CHANNELS] {
+        let mut stimuli = [0.0_f32; SNN_INPUT_CHANNELS];
+        for spike in &encoded.spikes {
+            let idx = spike.channel as usize;
+            if idx < SNN_INPUT_CHANNELS {
+                let delta = if spike.polarity { 1.0 } else { -1.0 };
+                stimuli[idx] = (stimuli[idx] + delta).clamp(-1.0, 1.0);
+            }
+        }
+        stimuli
     }
 
     /// Publish a [`TrainSignal`] to `SpikenautDistill.jl` via the ZMQ spine.
@@ -290,7 +328,7 @@ impl HybridModel {
 ///   are mapped 1-to-1 with clamping.
 /// - Encoder-exclusive fields (`fpga_stress`, `market_volatility`) are folded
 ///   into the composite cortisol signal.
-fn bridge_modulators(enc: &spikenaut_encoder::NeuroModulators) -> neuromod::NeuroModulators {
+fn bridge_modulators(enc: &EncoderNeuroModulators) -> neuromod::NeuroModulators {
     let composite_cortisol = (enc.cortisol + enc.market_volatility * 0.5).clamp(0.0, 1.0);
     neuromod::NeuroModulators {
         dopamine:        enc.dopamine.clamp(0.0, 1.0),
@@ -306,6 +344,7 @@ fn bridge_modulators(enc: &spikenaut_encoder::NeuroModulators) -> neuromod::Neur
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{OlmoeExecutionMode, ProjectionMode};
     use spikenaut_telemetry::TelemetrySnapshot;
 
     fn default_model() -> HybridModel {
@@ -347,6 +386,25 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_clears_olmoe_spiking_state() {
+        let cfg = HybridConfig {
+            olmoe_execution_mode: OlmoeExecutionMode::SpikingSim,
+            ..Default::default()
+        };
+        let mut model = HybridModel::new(cfg).unwrap();
+
+        for _ in 0..8 {
+            model.forward(&TelemetrySnapshot::default()).unwrap();
+        }
+
+        assert!(model.olmoe.has_state_activity());
+
+        model.reset();
+
+        assert!(!model.olmoe.has_state_activity());
+    }
+
+    #[test]
     fn test_invalid_snn_steps_zero() {
         let cfg = HybridConfig { snn_steps: 0, ..Default::default() };
         assert!(HybridModel::new(cfg).is_err());
@@ -363,7 +421,7 @@ mod tests {
         let mut model = default_model();
         let snap = TelemetrySnapshot {
             gpu_temp_c: 72.0, gpu_power_w: 280.0,
-            cpu_tctl_c: 65.0, dynex_hashrate_mh: 0.01,
+            cpu_tctl_c: 65.0, workload_throughput: 10.0, workload_efficiency: 0.7,
             ..Default::default()
         };
         let loss = model.train_step(&snap, &vec![0.1_f32; EMBEDDING_DIM]).unwrap();
@@ -376,6 +434,7 @@ mod tests {
             ProjectionMode::RateSum,
             ProjectionMode::TemporalHistogram,
             ProjectionMode::MembraneSnapshot,
+            ProjectionMode::SpikingTernary,
         ] {
             let cfg = HybridConfig { projection_mode: mode, ..Default::default() };
             let mut model = HybridModel::new(cfg).unwrap();
@@ -386,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_bridge_neuromod_clamps() {
-        let enc = spikenaut_encoder::NeuroModulators {
+        let enc = EncoderNeuroModulators {
             dopamine: 1.5,           // clamped → 1.0
             cortisol: 0.4,
             acetylcholine: 0.7,
