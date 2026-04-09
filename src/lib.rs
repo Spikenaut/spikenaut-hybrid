@@ -85,7 +85,7 @@ pub mod types;
 pub use hybrid::HybridModel;
 
 /// Configuration and output types.
-pub use types::{HybridConfig, HybridOutput, ProjectionMode, TrainSignal};
+pub use types::{HybridConfig, HybridOutput, OlmoeExecutionMode, ProjectionMode, TrainSignal};
 pub use types::{EMBEDDING_DIM, SNN_INPUT_CHANNELS};
 
 /// Error type.

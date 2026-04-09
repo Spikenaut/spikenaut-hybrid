@@ -16,22 +16,22 @@ path = "src/lib.rs"
 
 # ── Spikenaut ecosystem crates ─────────────────────────────────────────────────
 [dependencies]
-spikenaut-telemetry = { version = "0.1", path = "../spikenaut-telemetry" }
-spikenaut-encoder   = { version = "0.1", path = "../spikenaut-encoder" }
-neuromod            = { version = "0.3", path = "../neuromod" }
-spikenaut-spine     = { version = "0.1", path = "../spikenaut-spine" }
+spikenaut-telemetry = { workspace = true }
+spikenaut-encoder   = { workspace = true }
+neuromod            = { workspace = true }
+spikenaut-spine     = { workspace = true }
 
 # ── Serialisation / Utility ────────────────────────────────────────────────────
-serde      = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror  = "1.0"
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
 
 # ── Optional: safetensors loading (pure Rust, no Candle) ───────────────────────
 safetensors = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # examples only — no extra overhead in the lib
-serde_json = "1.0"
+serde_json = { workspace = true }
 
 # ── Feature flags ──────────────────────────────────────────────────────────────
 [features]

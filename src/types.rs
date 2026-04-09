@@ -52,6 +52,9 @@ pub struct HybridConfig {
     /// Number of experts activated per token (top-k routing, default 1).
     pub top_k_experts: usize,
 
+    /// Execution mode used by OLMoE.
+    pub olmoe_execution_mode: OlmoeExecutionMode,
+
     // ── SNN settings ─────────────────────────────────────────────────────────
     /// Number of SNN time-steps to simulate per forward call.
     /// Higher values give richer spike statistics at the cost of latency.
@@ -78,6 +81,7 @@ impl Default for HybridConfig {
             context_length: 512,
             num_experts: 8,
             top_k_experts: 1,
+            olmoe_execution_mode: OlmoeExecutionMode::StubUniform,
             snn_steps: 20,
             initial_dopamine: 0.5,
             projection_mode: ProjectionMode::RateSum,
@@ -104,6 +108,21 @@ pub enum ProjectionMode {
     /// **Membrane potential**: use the post-step membrane potentials directly
     /// instead of binary spikes — a smooth, differentiable approximation.
     MembraneSnapshot,
+
+    /// **Spiking ternary**: GIF membrane integration + ternary event output
+    /// (-1.0 / 0.0 / 1.0).  Sparse, event-driven embedding; the first real
+    /// SNN-logic quantized bridge to OLMoE (Optimal Brain Spiking style).
+    /// Membrane state persists across calls — reset via
+    /// [`Projector::reset_membrane`](crate::projector::Projector::reset_membrane).
+    SpikingTernary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OlmoeExecutionMode {
+    #[default]
+    StubUniform,
+    DenseSim,
+    SpikingSim,
 }
 
 // ── HybridOutput ──────────────────────────────────────────────────────────────

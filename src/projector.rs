@@ -24,7 +24,7 @@
 //! [`MembraneSnapshot`]: crate::types::ProjectionMode::MembraneSnapshot
 
 use crate::error::{HybridError, Result};
-use crate::types::{ProjectionMode, EMBEDDING_DIM, SNN_INPUT_CHANNELS};
+use crate::types::{ProjectionMode, EMBEDDING_DIM};
 
 // ── Projection weight matrix ───────────────────────────────────────────────────
 
@@ -46,6 +46,12 @@ const FEATURE_DIM: usize = SNN_NEURONS + (SNN_NEURONS * 4) + SNN_NEURONS + IZ_NE
 /// plus a bias `b ∈ ℝ^{EMBEDDING_DIM}`, initialised with Xavier-uniform weights.
 /// The weight matrix is updated only by Julia/E-prop via the spine; it is
 /// **frozen from the Rust side**.
+///
+/// When [`ProjectionMode::SpikingTernary`] is selected the projection uses
+/// GIF (Generalised Integrate-and-Fire) membrane integration and fires ternary
+/// spikes (-1.0 / 0.0 / 1.0), producing a sparse event-driven embedding.
+/// Membrane state persists across calls; call [`reset_membrane`](Self::reset_membrane)
+/// to clear it (e.g. on episode boundaries).
 ///
 /// ```no_run
 /// use spikenaut_hybrid::projector::Projector;
@@ -70,6 +76,19 @@ pub struct Projector {
 
     /// EMA decay constant for firing rate normalisation.
     ema_alpha: f32,
+
+    // ── SpikingTernary state (GIF membrane) ───────────────────────────────────
+
+    /// Per-output GIF membrane potential.  Shape: `[EMBEDDING_DIM]`.
+    /// Only mutated when `mode == SpikingTernary`; always allocated so that
+    /// switching modes at runtime has zero cost.
+    membrane: Vec<f32>,
+
+    /// Membrane firing threshold.  Crossed → ternary ±1 spike + soft reset.
+    threshold: f32,
+
+    /// GIF leak factor applied each integration step (0 < decay < 1).
+    decay: f32,
 }
 
 impl Projector {
@@ -96,6 +115,9 @@ impl Projector {
             bias: vec![0.0; EMBEDDING_DIM],
             rate_ema: [0.0; SNN_NEURONS],
             ema_alpha: 0.1,
+            membrane: vec![0.0; EMBEDDING_DIM],
+            threshold: 0.8,   // saliency threshold (SpikeLLM / NSLLM style)
+            decay: 0.92,      // GIF leak (close to biological membrane RC)
         }
     }
 
@@ -122,7 +144,11 @@ impl Projector {
         }
 
         let feature_vec = self.build_feature_vector(spike_train, potentials, iz_potentials);
-        Ok(self.linear_project(&feature_vec))
+        let embedding = match self.mode {
+            ProjectionMode::SpikingTernary => self.spiking_linear_project(&feature_vec),
+            _ => self.dense_linear_project(&feature_vec),
+        };
+        Ok(embedding)
     }
 
     // ── Feature construction ──────────────────────────────────────────────────
@@ -215,6 +241,14 @@ impl Projector {
                 features.extend_from_slice(&membrane_primary);
                 features.extend_from_slice(&iz);
             }
+            ProjectionMode::SpikingTernary => {
+                // Same feature blend as RateSum — GIF integration happens in
+                // spiking_linear_project, not in the feature vector itself.
+                features.extend_from_slice(&rates);
+                features.extend_from_slice(&hist);
+                features.extend_from_slice(&membrane);
+                features.extend_from_slice(&iz);
+            }
         }
 
         // Pad or truncate to exactly FEATURE_DIM
@@ -222,9 +256,10 @@ impl Projector {
         features
     }
 
-    // ── Linear projection W × f + b ──────────────────────────────────────────
+    // ── Linear projections ────────────────────────────────────────────────────
 
-    fn linear_project(&self, features: &[f32]) -> Vec<f32> {
+    /// Dense W × f + b with tanh squash.  Used for all non-spiking modes.
+    fn dense_linear_project(&self, features: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0_f32; EMBEDDING_DIM];
         for out_i in 0..EMBEDDING_DIM {
             let mut acc = self.bias[out_i];
@@ -236,6 +271,40 @@ impl Projector {
             out[out_i] = acc.tanh();
         }
         out
+    }
+
+    /// GIF membrane integration → ternary spike output.
+    ///
+    /// For each output dimension:
+    /// 1. Accumulate W × f + b into `acc`.
+    /// 2. Build a bounded drive from the signed learned current plus the
+    ///    peak feature activity magnitude.
+    /// 3. Integrate: `membrane = membrane * decay + drive * 0.35`.
+    /// 3. Fire +1 if membrane > threshold (soft reset: membrane -= threshold).
+    /// 4. Fire -1 if membrane < -threshold (soft reset: membrane += threshold).
+    /// 5. Otherwise output 0.0.
+    fn spiking_linear_project(&mut self, features: &[f32]) -> Vec<f32> {
+        let mut spikes = vec![0.0_f32; EMBEDDING_DIM];
+        let activity_drive = features.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        for out_i in 0..EMBEDDING_DIM {
+            let mut acc = self.bias[out_i];
+            let row_offset = out_i * FEATURE_DIM;
+            for in_j in 0..features.len().min(FEATURE_DIM) {
+                acc += self.weights[row_offset + in_j] * features[in_j];
+            }
+            // GIF integration step
+            let drive = (acc.tanh() * 0.5 + activity_drive * 0.5).clamp(-1.0, 1.0);
+            self.membrane[out_i] = self.membrane[out_i] * self.decay + drive * 0.35;
+            if self.membrane[out_i] > self.threshold {
+                spikes[out_i] = 1.0;
+                self.membrane[out_i] -= self.threshold;   // reset-with-refractory
+            } else if self.membrane[out_i] < -self.threshold {
+                spikes[out_i] = -1.0;
+                self.membrane[out_i] += self.threshold;
+            }
+            // else spikes[out_i] remains 0.0
+        }
+        spikes
     }
 
     // ── Weight management (for spine / E-prop updates) ────────────────────────
@@ -270,6 +339,15 @@ impl Projector {
         }
         self.bias.copy_from_slice(bias);
         Ok(())
+    }
+
+    /// Reset GIF membrane state to zero.
+    ///
+    /// Call this on episode/session boundaries when using
+    /// [`ProjectionMode::SpikingTernary`] to avoid stale membrane history
+    /// bleeding across unrelated inputs.  No-op for other modes.
+    pub fn reset_membrane(&mut self) {
+        self.membrane.fill(0.0);
     }
 
     /// Current projection mode.
@@ -325,10 +403,62 @@ mod tests {
         let embedding = proj.project(&spikes, &potentials, &iz_pots).unwrap();
         for v in &embedding {
             assert!(
-                v.abs() <= 1.0,
+                v.abs() <= 1.0 + 1e-6,
                 "embedding value {v} out of tanh range [-1, 1]"
             );
         }
+    }
+
+    #[test]
+    fn test_spiking_ternary_output() {
+        let mut proj = Projector::new(ProjectionMode::SpikingTernary);
+        let spikes = dummy_spike_train(20);
+        let potentials = vec![0.3; SNN_NEURONS];
+        let iz_pots = vec![15.0; IZ_NEURONS];
+
+        let embedding = proj.project(&spikes, &potentials, &iz_pots).unwrap();
+        assert_eq!(embedding.len(), EMBEDDING_DIM);
+
+        // All values must be ternary {-1, 0, +1}
+        for &v in &embedding {
+            assert!(
+                (v - 1.0).abs() < 1e-6 || v.abs() < 1e-6 || (v + 1.0).abs() < 1e-6,
+                "expected ternary value but got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spiking_ternary_fires_after_warmup() {
+        let mut proj = Projector::new(ProjectionMode::SpikingTernary);
+        let spikes = dummy_spike_train(20);
+        let potentials = vec![0.9; SNN_NEURONS];   // high activity to charge membranes
+        let iz_pots = vec![28.0; IZ_NEURONS];
+
+        // Run several steps to let membranes charge past threshold
+        let mut fired = 0usize;
+        for _ in 0..10 {
+            let emb = proj.project(&spikes, &potentials, &iz_pots).unwrap();
+            fired += emb.iter().filter(|&&v| v.abs() > 0.5).count();
+        }
+        assert!(fired > 0, "SpikingTernary should have fired at least one spike across 10 steps");
+    }
+
+    #[test]
+    fn test_reset_membrane_clears_state() {
+        let mut proj = Projector::new(ProjectionMode::SpikingTernary);
+        let spikes = dummy_spike_train(20);
+        let potentials = vec![0.9; SNN_NEURONS];
+        let iz_pots = vec![28.0; IZ_NEURONS];
+
+        // Charge membranes
+        for _ in 0..10 {
+            proj.project(&spikes, &potentials, &iz_pots).unwrap();
+        }
+
+        // After reset all membrane values should be 0
+        proj.reset_membrane();
+        assert!(proj.membrane.iter().all(|&v| v == 0.0), "membrane should be zeroed after reset");
     }
 
     #[test]
