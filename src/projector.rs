@@ -1,297 +1,121 @@
-//! Spike-to-expert projector — the heart of the neuromorphic-ANN fusion.
+//! Pure-Rust embedding → SNN-stimulus adapter.
 //!
-//! The [`Projector`] sits between the Spikenaut SNN and OLMoE's expert router.
-//! Its job is to compress the high-dimensional spike activity (neuron indices +
-//! firing rates + membrane potentials) into a single dense embedding vector
-//! that OLMoE can use as a context prefix.
+//! Replaces the legacy Xavier-weighted, SNN-to-embedding `Projector` with a
+//! minimal **read-only mathematical adapter**. No learnable state, no
+//! Candle / `candle_core::Tensor` imports, no `spike-lmo` coupling.
 //!
-//! # Projection modes
+//! # Pipeline
 //!
-//! | Mode | Description | Best for |
-//! |------|-------------|----------|
-//! | [`RateSum`] | Per-neuron spike-count → linear projection | rate-coded telemetry |
-//! | [`TemporalHistogram`] | Spikes binned over time → flatten | timing-sensitive HFT |
-//! | [`MembraneSnapshot`] | Post-step membrane potentials → linear | smooth gradient flow |
+//! ```text
+//! cortex_tensor::Tensor  ──▶  mean-pool over seq   (if 2-D [seq, dim])
+//!                         ──▶  resample to `snn_width`  (stride-pool or pad)
+//!                         ──▶  tanh()  ← strictly bounded in (-1, 1)
+//!                         ──▶  Vec<f32>  (length == snn_width)
+//! ```
 //!
-//! # No OLMoE dependency
-//!
-//! The projector is intentionally **pure** — it depends only on the spike
-//! activity types produced by `neuromod` and emits a plain `Vec<f32>`.
-//! This keeps it reusable with any LLM backend.
-//!
-//! [`RateSum`]: crate::types::ProjectionMode::RateSum
-//! [`TemporalHistogram`]: crate::types::ProjectionMode::TemporalHistogram
-//! [`MembraneSnapshot`]: crate::types::ProjectionMode::MembraneSnapshot
+//! The `tanh` squash is applied **after** the pool + resize step so the
+//! output range is guaranteed to live in `(-1, 1)` regardless of the
+//! transformer's raw activation magnitudes. `neuromod::SpikingNetwork`
+//! requires bounded input to prevent membrane-voltage blow-ups.
 
-use crate::error::{HybridError, Result};
-use crate::types::{ProjectionMode, EMBEDDING_DIM, SNN_INPUT_CHANNELS};
+use cortex_tensor::Tensor;
 
-// ── Projection weight matrix ───────────────────────────────────────────────────
-
-/// Number of neurons in the Spikenaut SNN.
-const SNN_NEURONS: usize = 16;
-
-/// Number of Izhikevich neurons in the adaptive bank.
-const IZ_NEURONS: usize = 5;
-
-/// Feature vector length before the linear projection.
-/// = rate features (16) + temporal bins (16 × 4) + membrane (16) + Iz potentials (5)
-const FEATURE_DIM: usize = SNN_NEURONS + (SNN_NEURONS * 4) + SNN_NEURONS + IZ_NEURONS;
-
-// ── Projector ─────────────────────────────────────────────────────────────────
-
-/// Converts Spikenaut SNN output into a dense embedding for OLMoE.
+/// Mean-pool a `[seq, dim]` tensor into a `[dim]`-long `Vec<f32>`.
 ///
-/// Internally this is a **learned linear layer** `W ∈ ℝ^{EMBEDDING_DIM × FEATURE_DIM}`
-/// plus a bias `b ∈ ℝ^{EMBEDDING_DIM}`, initialised with Xavier-uniform weights.
-/// The weight matrix is updated only by Julia/E-prop via the spine; it is
-/// **frozen from the Rust side**.
-///
-/// ```no_run
-/// use spikenaut_hybrid::projector::Projector;
-/// use spikenaut_hybrid::types::ProjectionMode;
-///
-/// let proj = Projector::new(ProjectionMode::RateSum);
-/// ```
-pub struct Projector {
-    /// Projection strategy.
-    mode: ProjectionMode,
-
-    /// Flat weight matrix `W`, row-major layout: `W[out * FEATURE_DIM + in]`.
-    /// Shape: `[EMBEDDING_DIM, FEATURE_DIM]`.
-    weights: Vec<f32>,
-
-    /// Bias vector `b`.  Shape: `[EMBEDDING_DIM]`.
-    bias: Vec<f32>,
-
-    /// Running exponential moving average of firing rates (for normalisation).
-    /// Updated each call to [`project`](Self::project).
-    rate_ema: [f32; SNN_NEURONS],
-
-    /// EMA decay constant for firing rate normalisation.
-    ema_alpha: f32,
+/// 1-D tensors are returned as-is. Higher-rank tensors are flattened to a
+/// single row. No tanh is applied here — this is a raw pooling helper.
+fn mean_pool(embedding: &Tensor) -> Vec<f32> {
+    match embedding.ndim() {
+        0 | 1 => embedding.data().to_vec(),
+        2 => {
+            let shape = embedding.shape();
+            let seq = shape[0].max(1);
+            let dim = shape[1];
+            let data = embedding.data();
+            let mut pooled = vec![0.0f32; dim];
+            for t in 0..seq {
+                let row = &data[t * dim..(t + 1) * dim];
+                for (i, v) in row.iter().enumerate() {
+                    pooled[i] += *v;
+                }
+            }
+            let inv = 1.0 / seq as f32;
+            for v in &mut pooled {
+                *v *= inv;
+            }
+            pooled
+        }
+        _ => {
+            // Fallback: treat the whole buffer as a flat vector.
+            embedding.data().to_vec()
+        }
+    }
 }
 
-impl Projector {
-    /// Create a new Projector with Xavier-uniform initialised weights.
-    ///
-    /// # Arguments
-    /// * `mode` — how to aggregate spike activity into a feature vector.
-    pub fn new(mode: ProjectionMode) -> Self {
-        let fan_in = FEATURE_DIM as f32;
-        let fan_out = EMBEDDING_DIM as f32;
-        let limit = (6.0_f32 / (fan_in + fan_out)).sqrt();
-
-        // Deterministic Xavier-uniform init (no external rng dep needed).
-        let mut weights = Vec::with_capacity(EMBEDDING_DIM * FEATURE_DIM);
-        for i in 0..(EMBEDDING_DIM * FEATURE_DIM) {
-            // Simple deterministic pseudo-random from index hash.
-            let t = ((i as f32 * 1.6180339887) % 1.0) * 2.0 - 1.0;
-            weights.push(t * limit);
-        }
-
-        Self {
-            mode,
-            weights,
-            bias: vec![0.0; EMBEDDING_DIM],
-            rate_ema: [0.0; SNN_NEURONS],
-            ema_alpha: 0.1,
-        }
+/// Resize a 1-D vector to exactly `target_width` entries by stride-pooling
+/// (when `src.len() > target_width`) or zero-padding (when shorter).
+fn resize_to(src: &[f32], target_width: usize) -> Vec<f32> {
+    if target_width == 0 {
+        return Vec::new();
+    }
+    let src_len = src.len();
+    if src_len == 0 {
+        return vec![0.0; target_width];
+    }
+    if src_len == target_width {
+        return src.to_vec();
     }
 
-    /// Project SNN spike activity into a dense embedding.
-    ///
-    /// # Arguments
-    /// * `spike_train`  — per-step spike sets from `SpikingNetwork::step`.
-    /// * `potentials`   — membrane potentials after the final SNN time-step.
-    /// * `iz_potentials`— Izhikevich neuron voltages (5 adaptive neurons).
-    ///
-    /// # Returns
-    /// Dense embedding `Vec<f32>` of length [`EMBEDDING_DIM`].
-    pub fn project(
-        &mut self,
-        spike_train: &[Vec<usize>],
-        potentials: &[f32],
-        iz_potentials: &[f32],
-    ) -> Result<Vec<f32>> {
-        if potentials.len() < SNN_NEURONS {
-            return Err(HybridError::InputLengthMismatch {
-                expected: SNN_NEURONS,
-                got: potentials.len(),
-            });
-        }
-
-        let feature_vec = self.build_feature_vector(spike_train, potentials, iz_potentials);
-        Ok(self.linear_project(&feature_vec))
-    }
-
-    // ── Feature construction ──────────────────────────────────────────────────
-
-    fn build_feature_vector(
-        &mut self,
-        spike_train: &[Vec<usize>],
-        potentials: &[f32],
-        iz_potentials: &[f32],
-    ) -> Vec<f32> {
-        let n_steps = spike_train.len().max(1) as f32;
-
-        // 1. Firing rates per neuron [16 dims]
-        let mut rates = [0.0_f32; SNN_NEURONS];
-        for step in spike_train {
-            for &idx in step {
-                if idx < SNN_NEURONS {
-                    rates[idx] += 1.0;
-                }
-            }
-        }
-        for r in &mut rates {
-            *r /= n_steps;
-        }
-
-        // Update EMA for normalisation
-        for i in 0..SNN_NEURONS {
-            self.rate_ema[i] =
-                self.ema_alpha * rates[i] + (1.0 - self.ema_alpha) * self.rate_ema[i];
-        }
-
-        // 2. Temporal histogram bins (4 equal-width bins) [64 dims]
-        let bins = 4usize;
-        let mut hist = vec![0.0_f32; SNN_NEURONS * bins];
-        if !spike_train.is_empty() {
-            let steps = spike_train.len();
-            for (t, step) in spike_train.iter().enumerate() {
-                let bin = ((t * bins) / steps).min(bins - 1);
-                for &idx in step {
-                    if idx < SNN_NEURONS {
-                        hist[idx * bins + bin] += 1.0;
-                    }
-                }
-            }
-            let total = n_steps / bins as f32;
-            for h in &mut hist {
-                *h /= total.max(1.0);
-            }
-        }
-
-        // 3. Membrane potentials [16 dims] — clamped to [0, 1]
-        let membrane: Vec<f32> = potentials[..SNN_NEURONS]
-            .iter()
-            .map(|&v| v.clamp(0.0, 1.0))
-            .collect();
-
-        // 4. Izhikevich adaptive bank potentials [5 dims]
-        let iz: Vec<f32> = iz_potentials
-            .iter()
-            .take(IZ_NEURONS)
-            .map(|&v| (v / 30.0).clamp(-1.0, 1.0)) // Izhikevich Vpeak ≈ 30 mV
-            .chain(std::iter::repeat(0.0))
-            .take(IZ_NEURONS)
-            .collect();
-
-        // Mode-specific blending
-        let mut features = Vec::with_capacity(FEATURE_DIM);
-        match self.mode {
-            ProjectionMode::RateSum => {
-                features.extend_from_slice(&rates);
-                features.extend_from_slice(&hist);
-                features.extend_from_slice(&membrane);
-                features.extend_from_slice(&iz);
-            }
-            ProjectionMode::TemporalHistogram => {
-                // Weight histogram more heavily than raw rates
-                let weighted_rates: Vec<f32> = rates.iter().map(|r| r * 0.3).collect();
-                features.extend_from_slice(&weighted_rates);
-                let weighted_hist: Vec<f32> = hist.iter().map(|h| h * 2.0).collect();
-                features.extend_from_slice(&weighted_hist);
-                features.extend_from_slice(&membrane);
-                features.extend_from_slice(&iz);
-            }
-            ProjectionMode::MembraneSnapshot => {
-                // Use membrane directly as primary signal
-                let membrane_primary: Vec<f32> =
-                    membrane.iter().map(|v| v * 2.0).collect();
-                features.extend_from_slice(&rates);
-                features.extend_from_slice(&hist);
-                features.extend_from_slice(&membrane_primary);
-                features.extend_from_slice(&iz);
-            }
-        }
-
-        // Pad or truncate to exactly FEATURE_DIM
-        features.resize(FEATURE_DIM, 0.0);
-        features
-    }
-
-    // ── Linear projection W × f + b ──────────────────────────────────────────
-
-    fn linear_project(&self, features: &[f32]) -> Vec<f32> {
-        let mut out = vec![0.0_f32; EMBEDDING_DIM];
-        for out_i in 0..EMBEDDING_DIM {
-            let mut acc = self.bias[out_i];
-            let row_offset = out_i * FEATURE_DIM;
-            for in_j in 0..features.len().min(FEATURE_DIM) {
-                acc += self.weights[row_offset + in_j] * features[in_j];
-            }
-            // Layer norm approximation: tanh squash keeps embedding bounded
-            out[out_i] = acc.tanh();
+    if src_len > target_width {
+        // Average-pool each contiguous chunk into a single output value.
+        let mut out = Vec::with_capacity(target_width);
+        for i in 0..target_width {
+            let start = (i * src_len) / target_width;
+            let end = ((i + 1) * src_len) / target_width;
+            let end = end.max(start + 1).min(src_len);
+            let slice = &src[start..end];
+            let mean = slice.iter().sum::<f32>() / slice.len() as f32;
+            out.push(mean);
         }
         out
-    }
-
-    // ── Weight management (for spine / E-prop updates) ────────────────────────
-
-    /// Replace the weight matrix with values received from `SpikenautDistill.jl`.
-    ///
-    /// Julia sends the updated projector weights as a flat `f32` slice via the
-    /// spine after each E-prop step.
-    ///
-    /// # Errors
-    /// Returns [`HybridError::InputLengthMismatch`] if the slice length ≠
-    /// `EMBEDDING_DIM × FEATURE_DIM`.
-    pub fn load_weights(&mut self, weights: &[f32]) -> Result<()> {
-        let expected = EMBEDDING_DIM * FEATURE_DIM;
-        if weights.len() != expected {
-            return Err(HybridError::InputLengthMismatch {
-                expected,
-                got: weights.len(),
-            });
-        }
-        self.weights.copy_from_slice(weights);
-        Ok(())
-    }
-
-    /// Replace the bias vector.
-    pub fn load_bias(&mut self, bias: &[f32]) -> Result<()> {
-        if bias.len() != EMBEDDING_DIM {
-            return Err(HybridError::InputLengthMismatch {
-                expected: EMBEDDING_DIM,
-                got: bias.len(),
-            });
-        }
-        self.bias.copy_from_slice(bias);
-        Ok(())
-    }
-
-    /// Current projection mode.
-    pub fn mode(&self) -> ProjectionMode {
-        self.mode
-    }
-
-    /// Dimensionality constants (useful for allocating buffers).
-    pub fn dims(&self) -> (usize, usize) {
-        (FEATURE_DIM, EMBEDDING_DIM)
-    }
-
-    /// Firing rate EMA snapshot (useful for diagnostics / reward shaping).
-    pub fn rate_ema(&self) -> &[f32; SNN_NEURONS] {
-        &self.rate_ema
+    } else {
+        // Pad with zeros on the right (stable & deterministic).
+        let mut out = Vec::with_capacity(target_width);
+        out.extend_from_slice(src);
+        out.resize(target_width, 0.0);
+        out
     }
 }
 
-impl Default for Projector {
-    fn default() -> Self {
-        Self::new(ProjectionMode::RateSum)
+/// Apply `tanh` element-wise in place so every entry lies in `(-1, 1)`.
+fn squash_inplace(v: &mut [f32]) {
+    for x in v.iter_mut() {
+        *x = x.tanh();
     }
+}
+
+/// Project a `cortex_tensor::Tensor` embedding into a bounded SNN stimulus
+/// of length `embedding.dim()` (no resizing).
+///
+/// * 2-D `[seq, dim]` tensors are mean-pooled along the sequence axis.
+/// * 1-D tensors are used directly.
+/// * The final values are `tanh`-squashed into `(-1, 1)`.
+pub fn embed_to_stimuli(embedding: &Tensor) -> Vec<f32> {
+    let mut pooled = mean_pool(embedding);
+    squash_inplace(&mut pooled);
+    pooled
+}
+
+/// Project an embedding into a bounded SNN stimulus of length `snn_width`.
+///
+/// Pipeline (in order): **pool → resize → tanh**. The `tanh` is applied
+/// last so the final vector is always in `(-1, 1)` regardless of how the
+/// resize step combined the pooled values.
+pub fn embed_to_stimuli_with_width(embedding: &Tensor, snn_width: usize) -> Vec<f32> {
+    let pooled = mean_pool(embedding);
+    let mut resized = resize_to(&pooled, snn_width);
+    squash_inplace(&mut resized);
+    resized
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -300,59 +124,79 @@ impl Default for Projector {
 mod tests {
     use super::*;
 
-    fn dummy_spike_train(n_steps: usize) -> Vec<Vec<usize>> {
-        (0..n_steps)
-            .map(|t| vec![t % SNN_NEURONS, (t + 1) % SNN_NEURONS])
-            .collect()
+    #[test]
+    fn test_embed_to_stimuli_1d_bounded() {
+        let t = Tensor::from_vec(vec![100.0, -100.0, 0.0, 50.0], &[4]);
+        let out = embed_to_stimuli(&t);
+        assert_eq!(out.len(), 4);
+        // tanh saturates to exactly ±1.0 in f32 for very large inputs, so we
+        // require `abs <= 1.0` (the closed [-1, 1] range).
+        for v in &out {
+            assert!(v.abs() <= 1.0, "tanh must bound values in [-1, 1], got {v}");
+        }
+        // tanh(100) ≈ 1.0, tanh(-100) ≈ -1.0
+        assert!(out[0] > 0.99);
+        assert!(out[1] < -0.99);
+        assert!((out[2]).abs() < 1e-6); // tanh(0) == 0
     }
 
     #[test]
-    fn test_project_output_length() {
-        let mut proj = Projector::new(ProjectionMode::RateSum);
-        let spikes = dummy_spike_train(20);
-        let potentials = vec![0.3; SNN_NEURONS];
-        let iz_pots = vec![15.0; IZ_NEURONS];
-        let embedding = proj.project(&spikes, &potentials, &iz_pots).unwrap();
-        assert_eq!(embedding.len(), EMBEDDING_DIM);
+    fn test_embed_to_stimuli_2d_mean_pool() {
+        // shape [2, 3]: rows [1, 2, 3] and [3, 4, 5] → mean [2, 3, 4]
+        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0, 3.0, 4.0, 5.0], &[2, 3]);
+        let out = embed_to_stimuli(&t);
+        assert_eq!(out.len(), 3);
+        // Values should be tanh(2), tanh(3), tanh(4)
+        assert!((out[0] - 2.0f32.tanh()).abs() < 1e-5);
+        assert!((out[1] - 3.0f32.tanh()).abs() < 1e-5);
+        assert!((out[2] - 4.0f32.tanh()).abs() < 1e-5);
     }
 
     #[test]
-    fn test_project_values_bounded() {
-        let mut proj = Projector::new(ProjectionMode::TemporalHistogram);
-        let spikes = dummy_spike_train(10);
-        let potentials = vec![0.5; SNN_NEURONS];
-        let iz_pots = vec![30.0; IZ_NEURONS];
-        let embedding = proj.project(&spikes, &potentials, &iz_pots).unwrap();
-        for v in &embedding {
-            assert!(
-                v.abs() <= 1.0,
-                "embedding value {v} out of tanh range [-1, 1]"
-            );
+    fn test_embed_to_stimuli_with_width_downsamples() {
+        // 8 → 4 with a clean boundary: pairs are averaged then tanh'd.
+        let t = Tensor::from_vec(
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+            &[8],
+        );
+        let out = embed_to_stimuli_with_width(&t, 4);
+        assert_eq!(out.len(), 4);
+        assert!((out[0] - 0.0f32.tanh()).abs() < 1e-5);
+        assert!((out[1] - 1.0f32.tanh()).abs() < 1e-5);
+        assert!((out[2] - 2.0f32.tanh()).abs() < 1e-5);
+        assert!((out[3] - 3.0f32.tanh()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_embed_to_stimuli_with_width_pads() {
+        let t = Tensor::from_vec(vec![0.5, -0.5], &[2]);
+        let out = embed_to_stimuli_with_width(&t, 5);
+        assert_eq!(out.len(), 5);
+        // First two carry the signal, last three are tanh(0) == 0.
+        assert!((out[0] - 0.5f32.tanh()).abs() < 1e-5);
+        assert!((out[1] - (-0.5f32).tanh()).abs() < 1e-5);
+        for v in &out[2..] {
+            assert!(v.abs() < 1e-6);
         }
     }
 
     #[test]
-    fn test_load_weights_length_check() {
-        let mut proj = Projector::new(ProjectionMode::RateSum);
-        let bad_weights = vec![0.0f32; 10]; // wrong length
-        assert!(proj.load_weights(&bad_weights).is_err());
+    fn test_embed_to_stimuli_with_width_strictly_bounded_after_resize() {
+        // Huge magnitudes: resize should average them, tanh should still
+        // clamp the final output to (-1, 1).
+        let t = Tensor::from_vec(vec![500.0; 128], &[128]);
+        let out = embed_to_stimuli_with_width(&t, 16);
+        assert_eq!(out.len(), 16);
+        for v in &out {
+            assert!(v.abs() <= 1.0, "tanh bound violated: {v}");
+            assert!(*v > 0.99); // tanh(500) saturates positive
+        }
     }
 
     #[test]
-    fn test_membrane_mode() {
-        let mut proj = Projector::new(ProjectionMode::MembraneSnapshot);
-        let spikes = dummy_spike_train(5);
-        let potentials = vec![0.8; SNN_NEURONS];
-        let iz_pots = vec![0.0; IZ_NEURONS];
-        let embedding = proj.project(&spikes, &potentials, &iz_pots).unwrap();
-        assert_eq!(embedding.len(), EMBEDDING_DIM);
-    }
-
-    #[test]
-    fn test_dims() {
-        let proj = Projector::default();
-        let (feat, emb) = proj.dims();
-        assert_eq!(feat, FEATURE_DIM);
-        assert_eq!(emb, EMBEDDING_DIM);
+    fn test_empty_width_returns_empty() {
+        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]);
+        let out = embed_to_stimuli_with_width(&t, 0);
+        assert!(out.is_empty());
     }
 }

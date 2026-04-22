@@ -1,149 +1,93 @@
-# spikenaut-hybrid
+# hybrid-fusion
 
-**Neuromorphic-ANN hybrid framework** — the high-level orchestrator for the
-[SpikeLMo](https://github.com/Spikenaut) fusion between the Spikenaut
-event-driven SNN and [OLMoE-1B-7B-0125-Instruct](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct).
+**Pure-Rust master orchestrator for a hybrid transformer ↔ spiking neural
+network stack.** Zero Candle, zero CUDA, zero Julia.
 
-[![Crates.io](https://img.shields.io/crates/v/spikenaut-hybrid)](https://crates.io/crates/spikenaut-hybrid)
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+`hybrid-fusion` wires together three focused crates:
 
----
+| Crate | Role |
+|-------|------|
+| [`cortex-tensor`](https://github.com/Limen-Neural/cortex-tensor) | Tensor, transformer, and MoE math. |
+| [`engram-parser`](https://github.com/Limen-Neural/engram-parser) | Zero-dep GGUF checkpoint parser. |
+| [`neuromod`](https://github.com/Limen-Neural/neuromod) 0.4.0 | LIF / Izhikevich spiking dynamics. |
 
-## Architecture
+The crate exposes a single orchestrator, `HybridNetwork`, that pipes a
+prompt through the transformer, reduces the resulting hidden state into a
+bounded stimulus vector, and steps a `neuromod::SpikingNetwork`.
 
+## Forward-pass data flow
+
+```text
+token_ids: &[u32]
+     │
+     ▼  cortex_tensor::TransformerLM::hidden_states
+cortex_tensor::Tensor   [seq_len, dim]
+     │
+     ▼  projector::embed_to_stimuli_with_width   (pool → resize → tanh)
+stimuli: Vec<f32>       ∈ [-1, 1], length == snn.num_channels
+     │
+     ▼  neuromod::SpikingNetwork::step(&stimuli, &modulators)
+fired_neurons: Vec<usize>
 ```
-TelemetrySnapshot (spikenaut-telemetry)
-       │
-       ▼  spikenaut-encoder
- NeuromodSensoryEncoder  →  [f32; 16] Poisson stimuli
-       │
-       ▼  neuromod
- SpikingNetwork × snn_steps  →  spike_train + membrane_potentials
-       │
-       ▼  spikenaut-hybrid :: Projector
- dense embedding  [DIM = 2048]
-       │
-       ▼  spikenaut-hybrid :: OLMoE  (frozen)
- OlmoeOutput { expert_weights, selected_experts, hidden }
-       │
-       ▼  spikenaut-spine  (optional, spine-zmq feature)
- TrainSignal  ──►  SpikenautDistill.jl  (E-prop on SNN only)
-```
+
+The `tanh` squash is applied **after** pooling and resizing so the values
+fed into the SNN are always bounded — `neuromod` requires bounded input
+to prevent membrane-voltage blow-ups.
 
 ## Quick start
 
 ```rust
-use spikenaut_hybrid::{HybridConfig, HybridModel};
-use spikenaut_telemetry::TelemetrySnapshot;
+use hybrid_fusion::{HybridConfig, HybridNetwork, NeuroModulators};
 
-// Stub mode (no GGUF download needed)
-let cfg = HybridConfig::default();
-let mut model = HybridModel::new(cfg)?;
+let mut net = HybridNetwork::from_config(HybridConfig::tiny())?;
 
-let snap = TelemetrySnapshot::default();
-let output = model.forward(&snap)?;
+let token_ids = [1u32, 2, 3, 4];
+let modulators = NeuroModulators::default();
 
-println!("Selected experts: {:?}", output.selected_experts);
+let out = net.forward(&token_ids, Some(modulators))?;
+
+assert_eq!(out.embedding.len(), net.transformer.config.dim);
+assert_eq!(out.stimuli.len(), net.snn.num_channels);
+# Ok::<(), hybrid_fusion::HybridError>(())
 ```
 
-With a real OLMoE checkpoint:
-
-```rust
-let cfg = HybridConfig {
-    olmoe_model_path: "/models/OLMoE-1B-7B-Q5_K_M.gguf".into(),
-    snn_steps: 20,
-    num_experts: 8,
-    top_k_experts: 1,
-    ..Default::default()
-};
-let mut model = HybridModel::new(cfg)?;
-```
-
-## Feature flags
-
-| Feature | What it enables |
-|---------|----------------|
-| `gguf` | GGUF Q5_K_M model parsing (pure Rust, no C++ llama.cpp) |
-| `safetensors` | BF16 `.safetensors` shard loading |
-| `spine-zmq` | ZMQ transport for Rust ↔ Julia training bridge |
-
-Add to `Cargo.toml`:
-
-```toml
-[dependencies]
-spikenaut-hybrid = { version = "0.1", features = ["gguf", "spine-zmq"] }
-```
-
-## Running the demo
+Run the bundled telemetry demo:
 
 ```bash
-# Stub mode — no checkpoint needed
 cargo run --example hybrid_telemetry
-
-# With a real GGUF model
-OLMOE_PATH=/models/OLMoE-1B-7B-Q5_K_M.gguf \
-  cargo run --example hybrid_telemetry --features gguf --release
 ```
 
-## Crate layout
+## Public surface
 
-| Source file | Responsibility |
-|-------------|---------------|
-| `src/lib.rs` | Public API, re-exports, crate-level docs |
-| `src/types.rs` | `HybridConfig`, `HybridOutput`, `ProjectionMode`, `TrainSignal` |
-| `src/error.rs` | `HybridError`, `Result` |
-| `src/projector.rs` | Spike → dense embedding (the neuromorphic fusion bridge) |
-| `src/olmoe.rs` | Frozen OLMoE inference (GGUF / safetensors / stub) |
-| `src/hybrid.rs` | `HybridModel` orchestrator |
-| `examples/hybrid_telemetry.rs` | End-to-end mining/HFT demo |
+| Item | Purpose |
+|------|---------|
+| `HybridNetwork::new(transformer, snn, config)` | Explicit constructor. |
+| `HybridNetwork::from_config(HybridConfig)` | Build from a config only (random weights). |
+| `HybridNetwork::load_weights_from_gguf(path)` | Parses GGUF layout via `engram-parser`. **TODO:** tensor binding pending a public `cortex-tensor` loader — surfaces an explicit `HybridError::UnsupportedFormat` rather than fabricating weights. |
+| `HybridNetwork::forward(&[u32], Option<NeuroModulators>)` | Transformer → projector → SNN. |
+| `projector::embed_to_stimuli(&Tensor)` | Pool + tanh-squash, width = embedding dim. |
+| `projector::embed_to_stimuli_with_width(&Tensor, width)` | Pool → resize → tanh to a caller-chosen width. |
+| `HybridConfig::tiny()` / `::olmo_1b()` | Predefined transformer + SNN shapes. |
 
-## Pipeline data flow
+All dimensions are **dynamic**. No hardcoded `16`-channel bottlenecks,
+no fixed `EMBEDDING_DIM = 2048`, no `NUM_INPUT_CHANNELS` constants leak
+through the public API.
 
-```
-HybridModel::forward(&TelemetrySnapshot)
-   ├─ snapshot_to_stimuli()          → [f32; 8]  normalised channels
-   ├─ NeuromodSensoryEncoder         → [f32; 16] bear/bull Poisson rates
-   ├─ SpikingNetwork::step() × N     → Vec<Vec<usize>> spike train
-   ├─ Projector::project()           → Vec<f32>  [2048] embedding
-   └─ OLMoE::forward()               → OlmoeOutput
-         ├─ expert_weights: Vec<f32> [8]
-         ├─ selected_experts: Vec<usize>
-         └─ hidden: Vec<f32> [2048]
+## What this crate is **not**
 
-HybridModel::train_step(&snap, &target)
-   ├─ forward()                      (as above)
-   ├─ MSE loss vs. target
-   └─ spine publish → SpikenautDistill.jl (E-prop on SNN only)
-```
+- **Not** a training framework. `neuromod` handles spike dynamics; any
+  learning loop (e.g. reward-modulated STDP) lives upstream.
+- **Not** a tokenizer. Callers pass `&[u32]` token IDs directly.
+- **Not** a Candle bridge. The previous `spike-lmo` / Candle-era fusion
+  engine, the `SnnLlmFusion` math, the `OLMoE` MoE wrapper, the
+  `DenseModel` trait, and the `spikenaut-spine` ZMQ distill publisher
+  have all been removed from this crate.
 
-## Ecosystem crates
+## Status
 
-| Crate | Role |
-|-------|------|
-| [`neuromod`](https://crates.io/crates/neuromod) | LIF + Izhikevich SNN with R-STDP |
-| [`spikenaut-encoder`](https://github.com/rmems/spikenaut-encoder) | Neuromodulator-driven Poisson encoding |
-| [`spikenaut-telemetry`](https://github.com/rmems/spikenaut-telemetry) | GPU/CPU/mining hardware telemetry |
-| [`spikenaut-spine`](https://github.com/rmems/spikenaut-spine) | ZMQ IPC Rust ↔ Julia bridge |
-| `SpikenautDistill.jl` | Julia E-prop / OTTT SNN trainer (private) |
-
-## Training loop
-
-Only the SNN is updated. OLMoE stays **completely frozen**:
-
-```
-┌──────────────────────────────┐
-│  Rust (spikenaut-hybrid)     │
-│  1. forward(snap)            │
-│  2. compute MSE loss         │
-│  3. build TrainSignal        │──────ZMQ──────►┌───────────────────────┐
-│  4. publish via spine        │                │  Julia (Distill.jl)   │
-└──────────────────────────────┘                │  E-prop / OTTT        │
-                                                │  Update SNN weights   │
-                                                │  Send new W_proj back │
-◄───────────────────────────────────────────────┤  via spine            │
- Projector::load_weights(W)                     └───────────────────────┘
-```
+Experimental. API is expected to change as `cortex-tensor` exposes its
+GGUF loader and as the projector grows richer pooling modes.
 
 ## License
 
-GPL-3.0-or-later — see [LICENSE](LICENSE).
+GPL-3.0-or-later.
