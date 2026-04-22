@@ -1,26 +1,27 @@
-//! Error types for `spikenaut-hybrid`.
+//! Error types for `hybrid-fusion`.
 //!
 //! All public functions in this crate return [`HybridError`] wrapped in a
-//! [`Result`].  Downstream callers can match on variants to distinguish
-//! configuration mistakes from I/O failures or runtime SNN errors.
+//! [`Result`]. The variants are intentionally minimal after the Candle /
+//! `spike-lmo` purge — only errors that can actually originate from the
+//! pure-Rust stack (`cortex-tensor`, `engram-parser`, `neuromod`) remain.
 
 use thiserror::Error;
 
-/// Unified error type for the hybrid framework.
+/// Unified error type for the hybrid orchestrator.
 #[derive(Debug, Error)]
 pub enum HybridError {
     // ── Configuration errors ──────────────────────────────────────────────
     /// A required field in [`HybridConfig`](crate::types::HybridConfig) was
-    /// empty or out of range.
+    /// empty, zero, or otherwise out of range.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
     // ── Model loading errors ──────────────────────────────────────────────
-    /// The GGUF or safetensors file could not be opened / parsed.
+    /// The GGUF checkpoint file could not be opened or parsed.
     #[error("model load failed for '{path}': {reason}")]
     ModelLoad { path: String, reason: String },
 
-    /// The model file format is not supported (e.g. wrong GGUF magic).
+    /// The checkpoint format is not supported (e.g. wrong GGUF magic).
     #[error("unsupported model format: {0}")]
     UnsupportedFormat(String),
 
@@ -28,27 +29,18 @@ pub enum HybridError {
     #[error("missing tensor '{name}' in model '{path}'")]
     MissingTensor { name: String, path: String },
 
+    /// GGUF header/metadata parse failure surfaced from `engram-parser`.
+    #[error("GGUF parse failed: {0}")]
+    GgufParse(String),
+
     // ── Forward-pass errors ───────────────────────────────────────────────
     /// Input slice had the wrong length.
     #[error("input length mismatch: expected {expected}, got {got}")]
     InputLengthMismatch { expected: usize, got: usize },
 
-    /// The SNN produced no spikes (silent network — likely a config problem).
-    #[error("SNN produced no spikes after {steps} steps — network may be silent")]
-    SilentNetwork { steps: usize },
-
-    /// OLMoE forward pass returned an error.
-    #[error("OLMoE forward pass failed: {0}")]
-    OlmoeForward(String),
-
-    // ── Spine / Julia IPC errors ──────────────────────────────────────────
-    /// The ZMQ spine could not be initialised (e.g. libzmq not installed).
-    #[error("spine initialisation failed: {0}")]
-    SpineInit(String),
-
-    /// Sending a loss signal to SpikenautDistill.jl failed mid-flight.
-    #[error("spine publish failed: {0}")]
-    SpinePublish(String),
+    /// `neuromod::SpikingNetwork::step` returned an error.
+    #[error("SNN step failed: {0}")]
+    SnnStep(String),
 
     // ── I/O errors ────────────────────────────────────────────────────────
     #[error("I/O error: {0}")]
@@ -61,3 +53,12 @@ pub enum HybridError {
 
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, HybridError>;
+
+// ── Cross-crate error bridges ─────────────────────────────────────────────
+
+impl From<neuromod::StepError> for HybridError {
+    fn from(err: neuromod::StepError) -> Self {
+        // `StepError` has no `Display` impl — use `Debug` formatting.
+        HybridError::SnnStep(format!("{err:?}"))
+    }
+}

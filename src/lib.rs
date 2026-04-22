@@ -1,111 +1,59 @@
-//! # spikenaut-hybrid
+//! # hybrid-fusion
 //!
-//! **Neuromorphic-ANN hybrid framework** — the top-level orchestrator for the
-//! [SpikeLMo](https://github.com/Spikenaut/spikenaut-hybrid) fusion between
-//! the Spikenaut SNN and [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct).
+//! Pure-Rust master orchestrator for a hybrid transformer ↔ spiking
+//! neural network stack. Zero Candle, zero CUDA, zero Julia.
 //!
-//! ## Architecture
+//! ## Pillars
+//!
+//! | Crate | Role |
+//! |-------|------|
+//! | [`cortex_tensor`] | Tensor + transformer + MoE math. |
+//! | [`engram_parser`] | GGUF checkpoint parser (zero-dep). |
+//! | [`neuromod`] | LIF / Izhikevich spiking dynamics (v0.4.0). |
+//!
+//! ## Data flow
 //!
 //! ```text
-//! ┌───────────────────────────────────────────────────────────────────────────┐
-//! │                       spikenaut-hybrid pipeline                           │
-//! │                                                                           │
-//! │  TelemetrySnapshot (spikenaut-telemetry)                                  │
-//! │        │                                                                  │
-//! │        ▼  spikenaut-encoder                                               │
-//! │  NeuromodSensoryEncoder  →  [f32; 16] Poisson stimuli                     │
-//! │        │                                                                  │
-//! │        ▼  neuromod                                                        │
-//! │  SpikingNetwork × snn_steps  →  spike_train + membrane_potentials         │
-//! │        │                                                                  │
-//! │        ▼  spikenaut-hybrid :: Projector                                   │
-//! │  dense embedding  [EMBEDDING_DIM = 2048]                                  │
-//! │        │                                                                  │
-//! │        ▼  spikenaut-hybrid :: OLMoE  (frozen)                             │
-//! │  OlmoeOutput { expert_weights, selected_experts, hidden }                 │
-//! │        │                                                                  │
-//! │        ▼  spikenaut-spine  (optional, spine-zmq feature)                  │
-//! │  TrainSignal  ──►  SpikenautDistill.jl  (E-prop / OTTT on SNN only)      │
-//! └───────────────────────────────────────────────────────────────────────────┘
+//! token_ids: &[u32]
+//!      │
+//!      ▼  cortex_tensor::TransformerLM::hidden_states
+//! cortex_tensor::Tensor   [seq_len, dim]
+//!      │
+//!      ▼  projector::embed_to_stimuli_with_width   (pool → resize → tanh)
+//! stimuli: Vec<f32>       strictly bounded in (-1, 1)
+//!      │
+//!      ▼  neuromod::SpikingNetwork::step(&stimuli, &modulators)
+//! fired_neurons: Vec<usize>
 //! ```
 //!
 //! ## Quick start
 //!
 //! ```no_run
-//! use spikenaut_hybrid::{HybridConfig, HybridModel};
-//! use spikenaut_telemetry::TelemetrySnapshot;
+//! use hybrid_fusion::{HybridConfig, HybridNetwork};
 //!
-//! // 1. Build config — empty model path means "stub mode" (no GPU/model needed)
-//! let cfg = HybridConfig {
-//!     olmoe_model_path: String::new(),   // stub; set to GGUF path for real inference
-//!     snn_steps: 20,
-//!     ..Default::default()
-//! };
-//!
-//! // 2. Instantiate the hybrid
-//! let mut model = HybridModel::new(cfg).unwrap();
-//!
-//! // 3. Feed telemetry
-//! let snap = TelemetrySnapshot::default();
-//! let output = model.forward(&snap).unwrap();
-//!
-//! println!("Firing rates:     {:?}", &output.firing_rates[..4]);
-//! println!("Selected experts: {:?}", output.selected_experts);
+//! let mut net = HybridNetwork::from_config(HybridConfig::tiny())?;
+//! let out = net.forward(&[1u32, 2, 3, 4], None)?;
+//! assert_eq!(out.stimuli.len(), net.snn.num_channels);
+//! # Ok::<(), hybrid_fusion::HybridError>(())
 //! ```
-//!
-//! ## Feature flags
-//!
-//! | Feature | What it adds |
-//! |---------|-------------|
-//! | `gguf` | GGUF Q5_K_M model parsing (pure Rust, no C++) |
-//! | `safetensors` | BF16 safetensors loading |
-//! | `spine-zmq` | ZMQ transport for Rust ↔ Julia training bridge |
-//!
-//! ## Crate layout
-//!
-//! | Module | Role |
-//! |--------|------|
-//! | [`types`] | `HybridConfig`, `HybridOutput`, `ProjectionMode`, `TrainSignal` |
-//! | [`error`] | `HybridError`, `Result` |
-//! | [`projector`] | Spike → dense embedding (the neuromorphic fusion bridge) |
-//! | [`olmoe`] | Frozen OLMoE inference engine |
-//! | [`hybrid`] | `HybridModel` top-level orchestrator |
-
-// ── Modules ───────────────────────────────────────────────────────────────────
 
 pub mod error;
 pub mod hybrid;
-pub mod olmoe;
 pub mod projector;
 pub mod types;
 
-// ── Public re-exports ─────────────────────────────────────────────────────────
+// ── Core re-exports ───────────────────────────────────────────────────────────
 
-/// Main hybrid model — start here.
-pub use hybrid::HybridModel;
-
-/// Configuration and output types.
-pub use types::{HybridConfig, HybridOutput, ProjectionMode, TrainSignal};
-pub use types::{EMBEDDING_DIM, SNN_INPUT_CHANNELS};
-
-/// Error type.
 pub use error::{HybridError, Result};
+pub use hybrid::HybridNetwork;
+pub use types::{HybridConfig, HybridOutput};
 
-/// Projector (re-exported for researchers who want to use it standalone).
-pub use projector::Projector;
+// ── Convenience re-exports from the pure-Rust stack ───────────────────────────
 
-// ── Lower-level crate re-exports ──────────────────────────────────────────────
-// Researchers can import these directly from spikenaut-hybrid without also
-// adding the lower-level crates to their own Cargo.toml.
+/// Re-exported so downstream users don't need a direct `cortex-tensor`
+/// dependency for the common tensor type.
+pub use cortex_tensor::Tensor;
 
-/// Re-export of `spikenaut-encoder` for convenience.
-pub use spikenaut_encoder;
-
-/// Re-export of `neuromod` for convenience.
-pub use neuromod;
-
-/// Re-export of `spikenaut-telemetry` for convenience.
-pub use spikenaut_telemetry;
-
-/// Re-export of `spikenaut-spine` for convenience.
-pub use spikenaut_spine;
+/// Re-exported `neuromod` neuromodulator struct — derived from telemetry /
+/// market-data upstream of the orchestrator.
+pub use neuromod::NeuroModulators;
